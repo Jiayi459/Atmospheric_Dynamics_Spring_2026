@@ -1,195 +1,206 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.optimize import brentq
 
-# -----------------------------
-# 0) Constants (SI units)
-# -----------------------------
-g   = 9.81
-Rd  = 287.0
-Rv  = 461.5
-cp  = 1004.0
-Lv  = 2.5e6            # latent heat of vaporization (J/kg), ok as constant here
-kappa = Rd / cp
+# ============================================================
+# CONSTANTS
+# ============================================================
+g    = 9.8          # m/s^2
+cp   = 1004.0       # J/(kg K)
+R    = 287.0        # J/(kg K)
+Rv   = 461.0        # J/(kg K)
+L    = 2.5e6        # J/kg latent heat
+kappa = R / cp      # = 0.2864
+p0   = 1000e2       # 1000 hPa in Pa
 
-# Saturation-mixing-ratio:
-# q*(p,T) = (Rd/Rv) * (A * exp(B*T)) / p
-# !!! YOU MUST fill A and B from your class handout !!!
-A = 6.11   
-B = 0.0676  
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-# For plotting z from p: isothermal approx z = -H0 ln(p/p0)
-H0 = 8000.0  # m, just for plotting
+def e_sat(T):
+    """Saturation vapor pressure [Pa] via Clausius-Clapeyron."""
+    return 611.0 * np.exp((L / Rv) * (1/273.15 - 1/T))
 
-# -----------------------------
-# 1) Surface conditions for (b)
-# -----------------------------
-p0_hPa = 1000.0
-p0 = p0_hPa * 100.0        # Pa
-T0 = 20.0 + 273.15         # K
-RH = 0.70
+def q_sat(T, p):
+    """Saturation specific humidity [kg/kg]."""
+    es = e_sat(T)
+    return 0.622 * es / (p - 0.378 * es)   # full formula; often approximated as 0.622*es/p
 
-# -----------------------------
-# 2) Helper functions
-# -----------------------------
-def qsat_fit(p_pa, T_k):
-    """Saturation mixing ratio q*(p,T) using the assignment's A,B fit."""
-    if A is None or B is None:
-        raise ValueError("Fill in A and B from your handout before running.")
-    # Empirical fit A=6.11 is typically in hPa, and B=0.0676 expects T in Celsius.
-    T_c = T_k - 273.15
-    p_hPa = p_pa / 100.0
-    return (Rd / Rv) * (A * np.exp(B * T_c)) / p_hPa
+def theta(T, p):
+    """Potential temperature [K]."""
+    return T * (p0 / p)**kappa
 
-def theta(T_k, p_pa):
-    return T_k * (p0 / p_pa) ** kappa
+def theta_e_surface(T0, p0_val, q0):
+    """Equivalent potential temperature at surface."""
+    return T0 * (p0 / p0_val)**kappa * np.exp(L * q0 / (cp * T0))
 
-def theta_e(T_k, p_pa, q):
-    """Assignment definition: theta_e = T (p0/p)^kappa exp(Lv q / (cp T))"""
-    return T_k * (p0 / p_pa) ** kappa * np.exp(Lv * q / (cp * T_k))
+def z_from_p(p, T_surf):
+    """Isothermal atmosphere: z = H0 * ln(p0/p)."""
+    H0 = R * T_surf / g
+    return H0 * np.log(p0 / p)
 
-def bisect_root(f, a, b, tol=1e-6, max_iter=200):
-    """Simple bisection root finder. Requires f(a) and f(b) opposite signs."""
-    fa = f(a)
-    fb = f(b)
-    if np.sign(fa) == np.sign(fb):
-        raise ValueError(f"Bisection bracket failed: f(a)={fa}, f(b)={fb}")
-    for _ in range(max_iter):
-        c = 0.5 * (a + b)
-        fc = f(c)
-        if abs(fc) < tol or (b - a) < tol:
-            return c
-        if np.sign(fc) == np.sign(fa):
-            a, fa = c, fc
-        else:
-            b, fb = c, fc
-    return 0.5 * (a + b)
+# ============================================================
+# INVERT theta_e to find T at a given pressure (Pauluis method)
+# ============================================================
 
-def solve_T_unsat(p_pa, thetae0, q0, T_low=170.0, T_high=320.0):
+def T_from_theta_e(theta_e_val, p):
     """
-    Solve theta_e(T,p,q0) = thetae0 for T assuming q=q0 (unsaturated guess).
+    Given conserved theta_e and pressure p, solve for T numerically.
+    Uses Brent's method on the equation:
+      theta_e = T*(p0/p)^kappa * exp(L*q*(T,p)/(cp*T))
     """
-    def f(T):
-        return theta_e(T, p_pa, q0) - thetae0
-    # Ensure bracket; expand if needed
-    a, b = T_low, T_high
-    fa, fb = f(a), f(b)
-    if np.sign(fa) == np.sign(fb):
-        # expand bracket a bit
-        for _ in range(20):
-            a = max(120.0, a - 10.0)
-            b = min(400.0, b + 10.0)
-            fa, fb = f(a), f(b)
-            if np.sign(fa) != np.sign(fb):
-                break
-    return bisect_root(f, a, b)
+    def equation(T):
+        qs = q_sat(T, p)
+        return T * (p0/p)**kappa * np.exp(L * qs / (cp * T)) - theta_e_val
 
-def solve_T_sat(p_pa, thetae0, T_low=170.0, T_high=320.0):
+    # Search in reasonable temperature range
+    try:
+        T_sol = brentq(equation, 150.0, 350.0)
+    except ValueError:
+        T_sol = np.nan
+    return T_sol
+
+# ============================================================
+# FIND LCL
+# ============================================================
+
+def find_LCL(T0, p0_val, q0):
     """
-    Solve theta_e(T,p,qsat(p,T)) = thetae0 for T in saturated regime.
+    Find the LCL pressure and temperature.
+    LCL: where q*(T_parcel, p) = q0, while T_parcel follows dry adiabat.
+    
+    Dry adiabat: theta is conserved => T(p) = T0*(p/p0)^kappa
+    Saturated when: q*(T(p), p) = q0
     """
-    def f(T):
-        qst = qsat_fit(p_pa, T)
-        return theta_e(T, p_pa, qst) - thetae0
-    a, b = T_low, T_high
-    fa, fb = f(a), f(b)
-    if np.sign(fa) == np.sign(fb):
-        for _ in range(30):
-            a = max(120.0, a - 10.0)
-            b = min(400.0, b + 10.0)
-            fa, fb = f(a), f(b)
-            if np.sign(fa) != np.sign(fb):
-                break
-    return bisect_root(f, a, b)
+    theta0 = T0  # since p=p0, theta = T0
 
-# -----------------------------
-# 3) Build pressure grid and compute profile
-# -----------------------------
-p_hPa = np.arange(1000.0, 99.0, -5.0)    # 1000 -> 100 hPa
-p_pa  = p_hPa * 100.0
+    def equation(p):
+        T_parcel = theta0 * (p / p0)**kappa
+        return q_sat(T_parcel, p) - q0
 
-# Surface q0 from RH * q*(p0,T0)
-q0 = RH * qsat_fit(p0, T0)
+    # Check if already saturated at surface
+    if q_sat(T0, p0_val) <= q0:
+        return p0_val, T0  # already at LCL
 
-# Conserved theta_e0
-thetae0 = theta_e(T0, p0, q0)
+    # LCL is below the surface pressure (higher p) — impossible,
+    # so search upward (lower p)
+    try:
+        p_LCL = brentq(equation, 1e4, p0_val - 1)
+    except ValueError:
+        p_LCL = np.nan
+    T_LCL = theta0 * (p_LCL / p0)**kappa
+    return p_LCL, T_LCL
 
-T_prof = np.zeros_like(p_pa)
-q_prof = np.zeros_like(p_pa)
-theta_prof = np.zeros_like(p_pa)
-thetae_prof = np.zeros_like(p_pa)
+# ============================================================
+# MAIN PROFILE COMPUTATION
+# ============================================================
 
-saturated = False
-p_LCL = None
-T_LCL = None
-idx_LCL = None
+def compute_profile(T0_C, RH, label, T_surf_for_z=None):
+    """
+    Compute T(z), theta(z), theta_e(z) for a lifted parcel.
+    
+    T0_C : surface temperature in Celsius
+    RH   : relative humidity (0 to 1)
+    label: string label for plot
+    T_surf_for_z: surface T used for isothermal z-conversion (default: T0)
+    """
+    T0 = T0_C + 273.15
+    if T_surf_for_z is None:
+        T_surf_for_z = T0
 
-for i, p in enumerate(p_pa):
-    if not saturated:
-        # Unsaturated "candidate" temperature
-        T1 = solve_T_unsat(p, thetae0, q0)
+    # Surface specific humidity
+    q0 = RH * q_sat(T0, p0)
+    print(f"\n=== {label} ===")
+    print(f"T0 = {T0:.2f} K, RH = {RH*100:.0f}%, q0 = {q0*1000:.3f} g/kg")
 
-        # Saturation check
-        qst1 = qsat_fit(p, T1)
-        if qst1 > q0:
-            # still unsaturated
-            T = T1
-            q = q0
-        else:
-            # reached saturation: mark LCL (approx at this level)
-            saturated = True
-            p_LCL = p
-            T_LCL = T1
-            idx_LCL = i
+    # Pressure levels from 1000 hPa down to 100 hPa
+    p_levels = np.linspace(p0, 1e4, 1000)  # Pa
 
-            # now solve saturated T properly at this same p
-            T = solve_T_sat(p, thetae0)
-            q = qsat_fit(p, T)
+    T_profile    = np.zeros_like(p_levels)
+    theta_profile = np.zeros_like(p_levels)
+    thetae_profile = np.zeros_like(p_levels)
+
+    if RH == 0:
+        # Part (a): purely dry, no moisture
+        theta0 = T0
+        for i, p in enumerate(p_levels):
+            T = theta0 * (p / p0)**kappa        # dry adiabat
+            T_profile[i] = T
+            theta_profile[i] = theta0           # conserved
+            thetae_profile[i] = theta0          # q=0, so theta_e = theta
+        p_LCL = None
     else:
-        # saturated regime
-        T = solve_T_sat(p, thetae0)
-        q = qsat_fit(p, T)
+        # Find LCL
+        p_LCL, T_LCL = find_LCL(T0, p0, q0)
+        z_LCL = z_from_p(p_LCL, T_surf_for_z)
+        print(f"LCL: p = {p_LCL/100:.1f} hPa, T = {T_LCL - 273.15:.2f} °C, z = {z_LCL:.0f} m")
 
-    T_prof[i] = T
-    q_prof[i] = q
-    theta_prof[i] = theta(T, p)
-    thetae_prof[i] = theta_e(T, p, q)
+        # Compute theta_e conserved above LCL (Pauluis method)
+        theta_e_parcel = theta_e_surface(T0, p0, q0)
+        print(f"theta_e (conserved above LCL) = {theta_e_parcel:.2f} K")
 
-# Convert p->z for plotting
-z_m  = -H0 * np.log(p_pa / p0)
-z_km = z_m / 1000.0
+        theta0 = T0  # for dry adiabat below LCL
 
-# -----------------------------
-# 4) Plot
-# -----------------------------
-fig, ax = plt.subplots(1, 3, figsize=(13, 5), sharey=True)
+        for i, p in enumerate(p_levels):
+            if p >= p_LCL:
+                # BELOW LCL: dry adiabat, q = q0 constant
+                T = theta0 * (p / p0)**kappa
+                T_profile[i] = T
+                theta_profile[i] = theta0
+                # theta_e: use actual q0 (not saturated yet)
+                thetae_profile[i] = T * (p0/p)**kappa * np.exp(L * q0 / (cp * T))
+            else:
+                # ABOVE LCL: Pauluis inversion, q = q*(T,p)
+                T = T_from_theta_e(theta_e_parcel, p)
+                T_profile[i] = T
+                theta_profile[i] = T * (p0/p)**kappa
+                qs = q_sat(T, p)
+                thetae_profile[i] = T * (p0/p)**kappa * np.exp(L * qs / (cp * T))
 
-ax[0].plot(T_prof - 273.15, z_km)
-ax[0].set_xlabel("T (°C)")
-ax[0].set_ylabel("z (km)")
-ax[0].set_title("Parcel T(z)")
+    # Convert p to z
+    z_levels = z_from_p(p_levels, T_surf_for_z) / 1000  # km
 
-ax[1].plot(theta_prof, z_km)
-ax[1].set_xlabel("θ (K)")
-ax[1].set_title("Potential Temperature θ(z)")
+    return z_levels, T_profile - 273.15, theta_profile, thetae_profile, p_LCL
 
-ax[2].plot(thetae_prof, z_km)
-ax[2].set_xlabel("θe (K)")
-ax[2].set_title("Equivalent Potential Temperature θe(z)")
+# ============================================================
+# RUN AND PLOT
+# ============================================================
 
-# Mark LCL
-if idx_LCL is not None:
-    z_LCL = z_km[idx_LCL]
-    for a in ax:
-        a.axhline(z_LCL, linestyle="--")
-    ax[0].text(T_prof[idx_LCL]-273.15, z_LCL, "  LCL", va="bottom")
+fig, axes = plt.subplots(1, 3, figsize=(15, 7), sharey=True)
+fig.suptitle("Lifted Parcel Profiles: T(z), θ(z), θ_e(z)", fontsize=14)
+
+cases = [
+    (20, 0.00, "a) NYC dry day (T=20°C, RH=0%)",   293.0),
+    (20, 0.70, "b) NYC fall day (T=20°C, RH=70%)", 293.0),
+    (35, 0.60, "c) NY-AD sultry day (T=35°C, RH=60%)", 308.0),
+]
+
+colors = ['steelblue', 'darkorange', 'crimson']
+
+for (T0_C, RH, label, T_z), color in zip(cases, colors):
+    z, T, th, the, p_LCL = compute_profile(T0_C, RH, label, T_z)
+
+    axes[0].plot(T,   z, color=color, label=label[:2])
+    axes[1].plot(th,  z, color=color, label=label[:2])
+    axes[2].plot(the, z, color=color, label=label[:2])
+
+    # Mark LCL
+    if p_LCL is not None:
+        H0 = R * T_z / g
+        z_LCL = H0 * np.log(p0 / p_LCL) / 1000
+        for ax in axes:
+            ax.axhline(z_LCL, color=color, linestyle='--', alpha=0.5, linewidth=1)
+
+# Formatting
+titles = ["T (°C)", "θ (K)", "θ_e (K)"]
+for ax, title in zip(axes, titles):
+    ax.set_xlabel(title, fontsize=12)
+    ax.set_ylabel("z (km)" if ax == axes[0] else "", fontsize=12)
+    ax.set_ylim(0, 17)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
 
 plt.tight_layout()
+plt.savefig("/Users/haojiayi/Atmospheric_Dynamics_Spring_2026/graph", dpi=150, bbox_inches='tight')
 plt.show()
-
-# -----------------------------
-# 5) Print LCL estimate
-# -----------------------------
-if p_LCL is not None:
-    print(f"LCL approx at p = {p_LCL/100:.1f} hPa, z ~ {(-H0*np.log(p_LCL/p0))/1000:.2f} km")
-else:
-    print("No LCL found (parcel stayed unsaturated to 100 hPa) — unlikely for RH=70%.")
+print("Saved to hw3_profiles.png")
